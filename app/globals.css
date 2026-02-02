@@ -1,26 +1,132 @@
+@import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@300;400;500;600;700;800&display=swap');
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  /* Colors - Primary */
+  --primary: #1f8a70;
+  --primary-hover: #18735e;
+  --primary-soft: #e8f5f1;
+  --primary-foreground: #ffffff;
+
+  /* Colors - Success */
+  --success: #4caf50;
+  --success-hover: #45a049;
+  --success-soft: #f1f8f4;
+  --success-foreground: #ffffff;
+
+  /* Colors - Accent */
+  --accent: #f4d35e;
+  --accent-hover: #f4c943;
+  --accent-soft: #fff8e7;
+  --accent-foreground: #1e2a2f;
+
+  /* Colors - Warning */
+  --warning: #f4b400;
+  --warning-hover: #d99b00;
+  --warning-soft: #fff3e0;
+  --warning-foreground: #1e2a2f;
+
+  /* Colors - Destructive */
+  --destructive: #e5533d;
+  --destructive-hover: #cc422f;
+  --destructive-soft: #ffebeb;
+  --destructive-foreground: #ffffff;
+
+  /* Colors - Background */
+  --background: #f6faf9;
+  --background-card: #ffffff;
+  --background-panel: #ffffff;
+  --background-secondary: #f0f5f4;
+
+  /* Colors - Foreground */
+  --foreground: #1e2a2f;
+  --foreground-secondary: #5f6c72;
+  --foreground-muted: #8a9aa5;
+  --foreground-inverse: #ffffff;
+
+  /* Colors - Border */
+  --border: #e2ece9;
+  --border-strong: #c9dad5;
+  --border-input: #e2ece9;
+
+  /* Chart Colors */
+  --chart-1: #1f8a70;
+  --chart-2: #f4d35e;
+  --chart-3: #e5533d;
+  --chart-4: #4caf50;
+  --chart-5: #f4b400;
+
+  /* Border Radius */
+  --radius: 0.625rem;
+  --radius-sm: 0.5rem;
+  --radius-md: 0.75rem;
+  --radius-lg: 1rem;
+  --radius-xl: 1.5rem;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+  --shadow-base: 0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px 0 rgba(0, 0, 0, 0.06);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+  --shadow-panel: 0 6px 18px rgba(0, 0, 0, 0.06);
+  --shadow-modal: 0 20px 48px rgba(0, 0, 0, 0.12);
 }
 
 @theme inline {
+  --color-primary: var(--primary);
+  --color-primary-hover: var(--primary-hover);
+  --color-primary-soft: var(--primary-soft);
+  --color-primary-foreground: var(--primary-foreground);
+
+  --color-success: var(--success);
+  --color-success-soft: var(--success-soft);
+
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+
+  --color-warning: var(--warning);
+  --color-warning-soft: var(--warning-soft);
+
+  --color-destructive: var(--destructive);
+  --color-destructive-soft: var(--destructive-soft);
+
   --color-background: var(--background);
+  --color-card: var(--background-card);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
+  --color-muted: var(--foreground-muted);
+  --color-border: var(--border);
+
+  --font-sans: 'Montserrat', system-ui, sans-serif;
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+* {
+  border-color: var(--border);
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: 'Montserrat', system-ui, sans-serif;
+  font-feature-settings: "rlig" 1, "calt" 1;
+}
+
+/* Scrollbar Styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--background-secondary);
+  border-radius: var(--radius);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: var(--radius);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--foreground-muted);
 }

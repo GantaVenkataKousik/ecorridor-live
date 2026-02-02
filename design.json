@@ -1,0 +1,309 @@
+{
+  "project": {
+    "name": "eCorridor",
+    "description": "Modern UI Design System with comprehensive design tokens",
+    "version": "1.0.0"
+  },
+  "colors": {
+    "primary": {
+      "main": "#1f8a70",
+      "hover": "#18735e",
+      "soft": "#e8f5f1",
+      "foreground": "#ffffff",
+      "description": "Primary brand color - Teal/Green"
+    },
+    "success": {
+      "main": "#4caf50",
+      "hover": "#45a049",
+      "soft": "#f1f8f4",
+      "foreground": "#ffffff",
+      "description": "Success/Positive state color - Green"
+    },
+    "accent": {
+      "main": "#f4d35e",
+      "hover": "#f4c943",
+      "soft": "#fff8e7",
+      "foreground": "#1e2a2f",
+      "description": "Accent color - Warm Yellow"
+    },
+    "warning": {
+      "main": "#f4b400",
+      "hover": "#d99b00",
+      "soft": "#fff3e0",
+      "foreground": "#1e2a2f",
+      "description": "Warning state color - Amber"
+    },
+    "destructive": {
+      "main": "#e5533d",
+      "hover": "#cc422f",
+      "soft": "#ffebeb",
+      "foreground": "#ffffff",
+      "description": "Destructive/Error state color - Red"
+    },
+    "background": {
+      "main": "#f6faf9",
+      "card": "#ffffff",
+      "panel": "#ffffff",
+      "secondary": "#f0f5f4",
+      "description": "Background colors for various surfaces"
+    },
+    "foreground": {
+      "primary": "#1e2a2f",
+      "secondary": "#5f6c72",
+      "muted": "#8a9aa5",
+      "inverse": "#ffffff",
+      "description": "Text colors with different emphasis levels"
+    },
+    "border": {
+      "main": "#e2ece9",
+      "strong": "#c9dad5",
+      "input": "#e2ece9",
+      "description": "Border colors for various UI elements"
+    },
+    "sidebar": {
+      "background": "#ffffff",
+      "foreground": "#1e2a2f",
+      "primary": "#1f8a70",
+      "primary-foreground": "#ffffff",
+      "accent": "#e8f5f1",
+      "accent-foreground": "#1f8a70",
+      "border": "#e2ece9",
+      "description": "Sidebar specific color palette"
+    },
+    "chart": {
+      "1": "#1f8a70",
+      "2": "#f4d35e",
+      "3": "#e5533d",
+      "4": "#4caf50",
+      "5": "#f4b400",
+      "description": "Colors for data visualization and charts"
+    }
+  },
+  "typography": {
+    "fonts": {
+      "sans": {
+        "family": "Montserrat, system-ui, sans-serif",
+        "description": "Primary font family for all text"
+      },
+      "mono": {
+        "family": "Geist Mono, Geist Mono Fallback",
+        "description": "Monospace font for code and technical content"
+      }
+    },
+    "fontSizes": {
+      "xs": "0.75rem",
+      "sm": "0.875rem",
+      "base": "1rem",
+      "lg": "1.125rem",
+      "xl": "1.25rem",
+      "2xl": "1.5rem",
+      "3xl": "1.875rem",
+      "4xl": "2.25rem",
+      "5xl": "3rem"
+    },
+    "fontWeights": {
+      "light": 300,
+      "normal": 400,
+      "medium": 500,
+      "semibold": 600,
+      "bold": 700,
+      "extrabold": 800
+    },
+    "lineHeights": {
+      "none": 1,
+      "tight": 1.25,
+      "snug": 1.375,
+      "normal": 1.5,
+      "relaxed": 1.625,
+      "loose": 2
+    },
+    "letterSpacing": {
+      "tighter": "-0.05em",
+      "tight": "-0.025em",
+      "normal": "0em",
+      "wide": "0.025em",
+      "wider": "0.05em",
+      "widest": "0.1em"
+    }
+  },
+  "spacing": {
+    "0": "0",
+    "1": "0.25rem",
+    "2": "0.5rem",
+    "3": "0.75rem",
+    "4": "1rem",
+    "6": "1.5rem",
+    "8": "2rem",
+    "10": "2.5rem",
+    "12": "3rem",
+    "16": "4rem",
+    "20": "5rem",
+    "24": "6rem",
+    "32": "8rem",
+    "40": "10rem",
+    "48": "12rem",
+    "56": "14rem",
+    "64": "16rem",
+    "description": "Spacing scale for margins, padding, gaps, and dimensions"
+  },
+  "borderRadius": {
+    "default": "0.625rem",
+    "none": "0",
+    "sm": "0.5rem",
+    "md": "0.75rem",
+    "lg": "1rem",
+    "xl": "1.5rem",
+    "full": "9999px",
+    "description": "Border radius values for rounded corners"
+  },
+  "shadows": {
+    "none": "none",
+    "sm": "0 1px 2px 0 rgba(0, 0, 0, 0.05)",
+    "base": "0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px 0 rgba(0, 0, 0, 0.06)",
+    "md": "0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)",
+    "lg": "0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05)",
+    "xl": "0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04)",
+    "panel": "0 6px 18px rgba(0, 0, 0, 0.06)",
+    "modal": "0 20px 48px rgba(0, 0, 0, 0.12)",
+    "description": "Shadow effects for depth and elevation"
+  },
+  "transitions": {
+    "durations": {
+      "instant": "0ms",
+      "fast": "150ms",
+      "base": "200ms",
+      "slow": "300ms",
+      "slower": "500ms"
+    },
+    "timings": {
+      "ease-in": "cubic-bezier(0.4, 0, 1, 1)",
+      "ease-out": "cubic-bezier(0, 0, 0.2, 1)",
+      "ease-in-out": "cubic-bezier(0.4, 0, 0.2, 1)",
+      "linear": "linear"
+    },
+    "description": "Animation durations and timing functions"
+  },
+  "zIndex": {
+    "hide": "-1",
+    "auto": "auto",
+    "0": "0",
+    "10": "10",
+    "20": "20",
+    "30": "30",
+    "40": "40",
+    "50": "50",
+    "dropdown": "1000",
+    "sticky": "1020",
+    "fixed": "1030",
+    "modal-backdrop": "1040",
+    "modal": "1050",
+    "popover": "1060",
+    "tooltip": "1070",
+    "description": "Z-index values for layering and stacking"
+  },
+  "breakpoints": {
+    "xs": "0px",
+    "sm": "640px",
+    "md": "768px",
+    "lg": "1024px",
+    "xl": "1280px",
+    "2xl": "1536px",
+    "description": "Responsive breakpoints for mobile-first design"
+  },
+  "components": {
+    "button": {
+      "heights": {
+        "sm": "2rem",
+        "md": "2.5rem",
+        "lg": "3rem"
+      },
+      "paddingX": {
+        "sm": "0.75rem",
+        "md": "1rem",
+        "lg": "1.5rem"
+      },
+      "fontSize": "1rem",
+      "fontWeight": 600,
+      "borderRadius": "0.625rem",
+      "description": "Button component specifications"
+    },
+    "input": {
+      "height": "2.5rem",
+      "paddingX": "1rem",
+      "paddingY": "0.75rem",
+      "fontSize": "1rem",
+      "borderRadius": "0.625rem",
+      "border": "1px",
+      "borderColor": "#e2ece9",
+      "description": "Input field component specifications"
+    },
+    "card": {
+      "padding": "1.5rem",
+      "borderRadius": "0.625rem",
+      "boxShadow": "0 6px 18px rgba(0, 0, 0, 0.06)",
+      "backgroundColor": "#ffffff",
+      "description": "Card component specifications"
+    },
+    "badge": {
+      "paddingX": "0.75rem",
+      "paddingY": "0.375rem",
+      "fontSize": "0.875rem",
+      "fontWeight": 500,
+      "borderRadius": "9999px",
+      "description": "Badge component specifications"
+    },
+    "alert": {
+      "padding": "1rem",
+      "borderRadius": "0.625rem",
+      "borderLeft": "4px",
+      "description": "Alert component specifications"
+    }
+  },
+  "opacity": {
+    "0": "0",
+    "5": "0.05",
+    "10": "0.1",
+    "20": "0.2",
+    "25": "0.25",
+    "30": "0.3",
+    "40": "0.4",
+    "50": "0.5",
+    "60": "0.6",
+    "70": "0.7",
+    "75": "0.75",
+    "80": "0.8",
+    "90": "0.9",
+    "95": "0.95",
+    "100": "1",
+    "description": "Opacity values for transparency"
+  },
+  "framework": {
+    "framework": "Next.js",
+    "styling": "Tailwind CSS",
+    "componentLibrary": "shadcn/ui with Radix UI",
+    "style": "new-york",
+    "tailwind": true,
+    "cssVariables": true,
+    "baseColor": "neutral",
+    "iconLibrary": "lucide-react",
+    "rsc": true,
+    "typescript": true,
+    "description": "Framework and tooling configuration"
+  },
+  "accessibility": {
+    "focusOutline": "2px solid #1f8a70",
+    "focusOutlineOffset": "2px",
+    "minTouchTarget": "44px",
+    "description": "Accessibility standards and practices"
+  },
+  "usage": {
+    "colorScheme": "CSS Variables are defined in app/globals.css and can be used in Tailwind classes",
+    "customization": "Modify colors in this design.json or directly in app/globals.css",
+    "tailwindIntegration": "All design tokens are integrated with Tailwind CSS through CSS variables",
+    "examples": {
+      "buttonPrimary": "bg-primary text-primary-foreground hover:bg-primary/90",
+      "cardLayout": "bg-card rounded-[var(--radius)] shadow-panel p-6",
+      "textHierarchy": "text-foreground for primary, text-muted for secondary"
+    }
+  }
+}
