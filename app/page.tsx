@@ -39,6 +39,7 @@ interface ColorMessage {
 }
 
 const LS_MATCHES_KEY = 'ecorridor_recent_matches';
+const LS_CAMERAS_KEY = 'ecorridor_camera_ids';
 
 function loadMatchesFromStorage(): RecentMatch[] {
   try {
@@ -50,12 +51,28 @@ function loadMatchesFromStorage(): RecentMatch[] {
   }
 }
 
+function loadCameraIdsFromStorage(): string[] {
+  try {
+    const raw = localStorage.getItem(LS_CAMERAS_KEY);
+    if (!raw) return [];
+    return JSON.parse(raw) as string[];
+  } catch {
+    return [];
+  }
+}
+
+// Save synchronously — called inline so data is never lost before a reload
 function saveMatchesToStorage(matches: RecentMatch[]) {
   try {
-    // Blob URLs are session-only — don't persist them
     const toSave = matches.map(m => ({ ...m, image: '' }));
     localStorage.setItem(LS_MATCHES_KEY, JSON.stringify(toSave));
   } catch { /* quota exceeded — ignore */ }
+}
+
+function saveCameraIdsToStorage(ids: string[]) {
+  try {
+    localStorage.setItem(LS_CAMERAS_KEY, JSON.stringify(ids));
+  } catch { /* ignore */ }
 }
 
 export default function LiveTrackerDashboard() {
@@ -64,25 +81,68 @@ export default function LiveTrackerDashboard() {
   // Per-camera metadata: camera_id → { frame_id, faces }
   const [cameraMeta, setCameraMeta] = useState<Map<string, { frame_id: number; faces: number }>>(new Map());
   // Ordered list of discovered camera IDs for layout
-  const [cameraIds, setCameraIds] = useState<string[]>([]);
+  const [cameraIds, setCameraIds] = useState<string[]>(() => loadCameraIdsFromStorage());
   // Per-camera canvas refs
   const canvasRefs = useRef<Map<string, HTMLCanvasElement>>(new Map());
+  // Expanded camera (click to zoom)
+  const [expandedCamera, setExpandedCamera] = useState<string | null>(null);
+  const expandedCameraRef = useRef<string | null>(null);
+  const expandedCanvasRef = useRef<HTMLCanvasElement>(null);
+  // Track the last rendered base64 per camera so we can repaint onto expanded canvas
+  const lastFrameRef = useRef<Map<string, string>>(new Map());
 
   const [recentMatches, setRecentMatches] = useState<RecentMatch[]>(() => loadMatchesFromStorage());
+  // Keep a ref to matches so beforeunload can read current value
+  const recentMatchesRef = useRef<RecentMatch[]>(recentMatches);
   // Keep tracker colors in a ref so renderToCanvas always reads fresh values without stale closure
   const trackerColorsRef = useRef<Map<number, string>>(new Map());
   const [trackerColors, setTrackerColors] = useState<Map<number, string>>(new Map());
   const colorTimeoutsRef = useRef<Map<number, NodeJS.Timeout>>(new Map());
 
-  // Persist matches to localStorage whenever they change
+  // Keep refs in sync
   useEffect(() => {
-    saveMatchesToStorage(recentMatches);
+    recentMatchesRef.current = recentMatches;
   }, [recentMatches]);
+
+  useEffect(() => {
+    expandedCameraRef.current = expandedCamera;
+  }, [expandedCamera]);
+
+  // Safety-net: flush to localStorage if the page unloads for any reason
+  useEffect(() => {
+    const onUnload = () => saveMatchesToStorage(recentMatchesRef.current);
+    window.addEventListener('beforeunload', onUnload);
+    return () => window.removeEventListener('beforeunload', onUnload);
+  }, []);
 
   // Keep trackerColorsRef in sync so canvas renderer always reads fresh values
   useEffect(() => {
     trackerColorsRef.current = trackerColors;
   }, [trackerColors]);
+
+  // ESC to close expanded camera
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setExpandedCamera(null); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
+  // When a camera is expanded, repaint its last frame immediately onto the expanded canvas
+  useEffect(() => {
+    if (!expandedCamera || !expandedCanvasRef.current) return;
+    const src = lastFrameRef.current.get(expandedCamera);
+    if (!src) return;
+    const canvas = expandedCanvasRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const img = new Image();
+    img.onload = () => {
+      canvas.width = img.width;
+      canvas.height = img.height;
+      ctx.drawImage(img, 0, 0);
+    };
+    img.src = src;
+  }, [expandedCamera]);
 
   const registerCanvas = useCallback((cameraId: string, el: HTMLCanvasElement | null) => {
     if (el) canvasRefs.current.set(cameraId, el);
@@ -145,7 +205,6 @@ export default function LiveTrackerDashboard() {
             const cropUrl = URL.createObjectURL(blob);
 
             setRecentMatches(prev => {
-              // Stable identity: if person already exists, update in-place (same detection, just refresh image)
               const existingIdx = prev.findIndex(p => p.id === matchData.person_id);
               const entry: RecentMatch = {
                 id: matchData.person_id,
@@ -154,16 +213,16 @@ export default function LiveTrackerDashboard() {
                 time: new Date().toLocaleTimeString(),
                 tracker_id: matchData.tracker_id
               };
-
+              let next: RecentMatch[];
               if (existingIdx !== -1) {
-                // Revoke previous blob URL to avoid memory leak
-                const old = prev[existingIdx];
-                if (old.image && old.image.startsWith('blob:')) URL.revokeObjectURL(old.image);
-                const next = [...prev];
+                next = [...prev];
                 next[existingIdx] = entry;
-                return next;
+              } else {
+                next = [entry, ...prev].slice(0, 20);
               }
-              return [entry, ...prev].slice(0, 20);
+              // Save synchronously right here — don't rely on useEffect timing
+              saveMatchesToStorage(next);
+              return next;
             });
           }
         })();
@@ -174,8 +233,13 @@ export default function LiveTrackerDashboard() {
           for await (const m of trackerSub) {
             const data = decode(m.data) as TrackerData;
 
-            // Register new cameras
-            setCameraIds(prev => prev.includes(data.camera_id) ? prev : [...prev, data.camera_id]);
+            // Register new cameras and persist
+            setCameraIds(prev => {
+              if (prev.includes(data.camera_id)) return prev;
+              const next = [...prev, data.camera_id];
+              saveCameraIdsToStorage(next);
+              return next;
+            });
             setCameraMeta(prev => {
               const next = new Map(prev);
               next.set(data.camera_id, { frame_id: data.frame_id, faces: data.tracked_faces?.length || 0 });
@@ -208,6 +272,8 @@ export default function LiveTrackerDashboard() {
           .reduce((data, byte) => data + String.fromCharCode(byte), '')
       );
       img.src = `data:image/jpeg;base64,${base64}`;
+      // Cache last frame so expanded view can repaint it
+      lastFrameRef.current.set(data.camera_id, img.src);
 
       img.onload = () => {
         if (canvas.width !== img.width) {
@@ -216,6 +282,16 @@ export default function LiveTrackerDashboard() {
         }
 
         ctx.drawImage(img, 0, 0);
+
+        // If this camera is currently expanded, mirror the frame there too
+        const expCanvas = expandedCanvasRef.current;
+        if (expCanvas && expandedCameraRef.current === data.camera_id) {
+          const expCtx = expCanvas.getContext('2d');
+          if (expCtx) {
+            if (expCanvas.width !== img.width) { expCanvas.width = img.width; expCanvas.height = img.height; }
+            expCtx.drawImage(canvas, 0, 0);
+          }
+        }
 
         // Draw Bounding Boxes
         data.tracked_faces?.forEach((face) => {
@@ -386,33 +462,81 @@ export default function LiveTrackerDashboard() {
                 </div>
               </div>
             ) : (
-              <div className={`grid gap-4 ${cameraIds.length > 1 ? 'grid-cols-2' : 'grid-cols-1'}`}>
-                {cameraIds.map(cameraId => {
-                  const meta = cameraMeta.get(cameraId);
-                  return (
-                    <div key={cameraId} className="space-y-2">
-                      <div className="flex items-center gap-2 px-1">
+              <>
+                {/* Expanded camera modal */}
+                {expandedCamera && (
+                  <div
+                    className="fixed inset-0 z-50 flex flex-col bg-black/95"
+                    onClick={() => setExpandedCamera(null)}
+                  >
+                    <div className="flex items-center justify-between px-5 py-3 border-b border-white/10">
+                      <div className="flex items-center gap-2">
                         <div className="h-2 w-2 rounded-full bg-success animate-pulse"></div>
-                        <span className="text-sm font-semibold text-foreground">Camera: {cameraId}</span>
-                        {meta && (
-                          <span className="ml-auto text-xs text-muted">
-                            Frame #{meta.frame_id.toLocaleString()} · {meta.faces} face{meta.faces !== 1 ? 's' : ''}
+                        <span className="text-sm font-semibold text-white">Camera: {expandedCamera}</span>
+                        {cameraMeta.get(expandedCamera) && (
+                          <span className="ml-2 text-xs text-white/50">
+                            Frame #{cameraMeta.get(expandedCamera)!.frame_id.toLocaleString()} · {cameraMeta.get(expandedCamera)!.faces} face{cameraMeta.get(expandedCamera)!.faces !== 1 ? 's' : ''}
                           </span>
                         )}
                       </div>
-                      <div className="rounded-lg bg-card p-1 shadow-panel">
-                        <div className="relative overflow-hidden rounded-md bg-black">
-                          <canvas
-                            ref={el => registerCanvas(cameraId, el)}
-                            className="w-full h-auto"
-                            style={{ maxHeight: cameraIds.length > 1 ? 'calc(50vh - 120px)' : 'calc(100vh - 240px)' }}
-                          />
+                      <button
+                        onClick={e => { e.stopPropagation(); setExpandedCamera(null); }}
+                        className="flex h-8 w-8 items-center justify-center rounded-full bg-white/10 hover:bg-white/20 text-white transition-colors"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                    <div className="flex-1 flex items-center justify-center p-4" onClick={e => e.stopPropagation()}>
+                      <canvas
+                        ref={expandedCanvasRef}
+                        className="max-w-full max-h-full rounded-lg"
+                        style={{ maxHeight: 'calc(100vh - 80px)' }}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {/* Camera grid */}
+                <div className={`grid gap-4 ${cameraIds.length > 1 ? 'grid-cols-2' : 'grid-cols-1'}`}>
+                  {cameraIds.map(cameraId => {
+                    const meta = cameraMeta.get(cameraId);
+                    return (
+                      <div key={cameraId} className="space-y-2">
+                        <div className="flex items-center gap-2 px-1">
+                          <div className="h-2 w-2 rounded-full bg-success animate-pulse"></div>
+                          <span className="text-sm font-semibold text-foreground">Camera: {cameraId}</span>
+                          {meta && (
+                            <span className="ml-auto text-xs text-muted">
+                              Frame #{meta.frame_id.toLocaleString()} · {meta.faces} face{meta.faces !== 1 ? 's' : ''}
+                            </span>
+                          )}
+                        </div>
+                        <div
+                          className="rounded-lg bg-card p-1 shadow-panel cursor-pointer group"
+                          onClick={() => setExpandedCamera(cameraId)}
+                          title="Click to expand"
+                        >
+                          <div className="relative overflow-hidden rounded-md bg-black">
+                            <canvas
+                              ref={el => registerCanvas(cameraId, el)}
+                              className="w-full h-auto"
+                              style={{ maxHeight: cameraIds.length > 1 ? 'calc(50vh - 120px)' : 'calc(100vh - 240px)' }}
+                            />
+                            {/* Expand hint on hover */}
+                            <div className="absolute inset-0 flex items-center justify-center bg-black/0 group-hover:bg-black/20 transition-all pointer-events-none">
+                              <div className="opacity-0 group-hover:opacity-100 transition-opacity bg-black/60 rounded-full p-2">
+                                <svg className="h-6 w-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
+                                </svg>
+                              </div>
+                            </div>
+                          </div>
                         </div>
                       </div>
-                    </div>
-                  );
-                })}
-              </div>
+                    );
+                  })}
+                </div>
+              </>
             )}
 
             {/* Aggregate Stats */}
