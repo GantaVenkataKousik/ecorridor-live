@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { connect } from 'nats.ws';
 import { decode } from '@msgpack/msgpack';
 
@@ -33,15 +33,65 @@ interface RecentMatch {
   tracker_id: number;
 }
 
+interface ColorMessage {
+  colorCode: string;
+  tracker_id?: number;
+}
+
+const LS_MATCHES_KEY = 'ecorridor_recent_matches';
+
+function loadMatchesFromStorage(): RecentMatch[] {
+  try {
+    const raw = localStorage.getItem(LS_MATCHES_KEY);
+    if (!raw) return [];
+    return JSON.parse(raw) as RecentMatch[];
+  } catch {
+    return [];
+  }
+}
+
+function saveMatchesToStorage(matches: RecentMatch[]) {
+  try {
+    // Blob URLs are session-only — don't persist them
+    const toSave = matches.map(m => ({ ...m, image: '' }));
+    localStorage.setItem(LS_MATCHES_KEY, JSON.stringify(toSave));
+  } catch { /* quota exceeded — ignore */ }
+}
+
 export default function LiveTrackerDashboard() {
   const [status, setStatus] = useState<'connecting' | 'connected' | 'error'>('connecting');
   const [errorMessage, setErrorMessage] = useState('');
-  const [meta, setMeta] = useState({ frame_id: 0, camera_id: "", faces: 0 });
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [recentMatches, setRecentMatches] = useState<RecentMatch[]>([]);
+  // Per-camera metadata: camera_id → { frame_id, faces }
+  const [cameraMeta, setCameraMeta] = useState<Map<string, { frame_id: number; faces: number }>>(new Map());
+  // Ordered list of discovered camera IDs for layout
+  const [cameraIds, setCameraIds] = useState<string[]>([]);
+  // Per-camera canvas refs
+  const canvasRefs = useRef<Map<string, HTMLCanvasElement>>(new Map());
+
+  const [recentMatches, setRecentMatches] = useState<RecentMatch[]>(() => loadMatchesFromStorage());
+  // Keep tracker colors in a ref so renderToCanvas always reads fresh values without stale closure
+  const trackerColorsRef = useRef<Map<number, string>>(new Map());
+  const [trackerColors, setTrackerColors] = useState<Map<number, string>>(new Map());
+  const colorTimeoutsRef = useRef<Map<number, NodeJS.Timeout>>(new Map());
+
+  // Persist matches to localStorage whenever they change
+  useEffect(() => {
+    saveMatchesToStorage(recentMatches);
+  }, [recentMatches]);
+
+  // Keep trackerColorsRef in sync so canvas renderer always reads fresh values
+  useEffect(() => {
+    trackerColorsRef.current = trackerColors;
+  }, [trackerColors]);
+
+  const registerCanvas = useCallback((cameraId: string, el: HTMLCanvasElement | null) => {
+    if (el) canvasRefs.current.set(cameraId, el);
+    else canvasRefs.current.delete(cameraId);
+  }, []);
 
   useEffect(() => {
     let nc: any;
+    let cancelled = false;
 
     async function setupNats() {
       try {
@@ -49,8 +99,43 @@ export default function LiveTrackerDashboard() {
           servers: ["ws://172.20.30.140:7777"],
           waitOnFirstConnect: true
         });
+        if (cancelled) { nc.close(); return; }
         setStatus('connected');
 
+        // ── frames.color ──────────────────────────────────────────────
+        const colorSub = nc.subscribe("frames.color");
+        (async () => {
+          for await (const m of colorSub) {
+            const colorData = decode(m.data) as ColorMessage;
+            const trackerId = colorData.tracker_id;
+            const color = colorData.colorCode.toLowerCase();
+
+            if (trackerId !== undefined) {
+              setTrackerColors(prev => {
+                const newMap = new Map(prev);
+                newMap.set(trackerId, color);
+                return newMap;
+              });
+
+              if (color === 'red') {
+                if (colorTimeoutsRef.current.has(trackerId)) {
+                  clearTimeout(colorTimeoutsRef.current.get(trackerId)!);
+                }
+                const timeoutId = setTimeout(() => {
+                  setTrackerColors(prev => {
+                    const newMap = new Map(prev);
+                    newMap.set(trackerId, 'green');
+                    return newMap;
+                  });
+                  colorTimeoutsRef.current.delete(trackerId);
+                }, 5000);
+                colorTimeoutsRef.current.set(trackerId, timeoutId);
+              }
+            }
+          }
+        })();
+
+        // ── frames.matches ────────────────────────────────────────────
         const matchSub = nc.subscribe("frames.matches");
         (async () => {
           for await (const m of matchSub) {
@@ -59,33 +144,50 @@ export default function LiveTrackerDashboard() {
             const blob = new Blob([new Uint8Array(matchData.face_crop as any)], { type: 'image/jpeg' });
             const cropUrl = URL.createObjectURL(blob);
 
-            setRecentMatches(prev => [
-              {
+            setRecentMatches(prev => {
+              // Stable identity: if person already exists, update in-place (same detection, just refresh image)
+              const existingIdx = prev.findIndex(p => p.id === matchData.person_id);
+              const entry: RecentMatch = {
                 id: matchData.person_id,
                 image: cropUrl,
                 score: (matchData.score * 100).toFixed(1),
                 time: new Date().toLocaleTimeString(),
                 tracker_id: matchData.tracker_id
-              },
-              ...prev
-            ].slice(0, 10));
+              };
+
+              if (existingIdx !== -1) {
+                // Revoke previous blob URL to avoid memory leak
+                const old = prev[existingIdx];
+                if (old.image && old.image.startsWith('blob:')) URL.revokeObjectURL(old.image);
+                const next = [...prev];
+                next[existingIdx] = entry;
+                return next;
+              }
+              return [entry, ...prev].slice(0, 20);
+            });
           }
         })();
 
-        const sub = nc.subscribe("frames.tracker");
+        // ── frames.tracker ─────────────────────────────────────────────
+        const trackerSub = nc.subscribe("frames.tracker");
+        (async () => {
+          for await (const m of trackerSub) {
+            const data = decode(m.data) as TrackerData;
 
-        for await (const m of sub) {
-          const data = decode(m.data) as TrackerData;
+            // Register new cameras
+            setCameraIds(prev => prev.includes(data.camera_id) ? prev : [...prev, data.camera_id]);
+            setCameraMeta(prev => {
+              const next = new Map(prev);
+              next.set(data.camera_id, { frame_id: data.frame_id, faces: data.tracked_faces?.length || 0 });
+              return next;
+            });
 
-          setMeta({
-            frame_id: data.frame_id,
-            camera_id: data.camera_id,
-            faces: data.tracked_faces?.length || 0
-          });
+            renderToCanvas(data);
+          }
+        })();
 
-          renderToCanvas(data);
-        }
       } catch (err: any) {
+        if (cancelled) return;
         console.error("NATS Error:", err);
         setStatus('error');
         setErrorMessage(err.message);
@@ -93,7 +195,7 @@ export default function LiveTrackerDashboard() {
     }
 
     function renderToCanvas(data: TrackerData) {
-      const canvas = canvasRef.current;
+      const canvas = canvasRefs.current.get(data.camera_id);
       if (!canvas || !data.image) return;
 
       const ctx = canvas.getContext('2d');
@@ -114,25 +216,76 @@ export default function LiveTrackerDashboard() {
 
         // Draw Bounding Boxes
         data.tracked_faces?.forEach((face) => {
-          const { person_id, bbox } = face;
+          const { person_id, bbox, tracker_id } = face;
           const [x, y, w, h] = bbox;
 
+          // Read from ref — always fresh, no stale closure
+          const trackerColor = trackerColorsRef.current.get(tracker_id);
+          let boxColor, bgColor, textColor;
+
+          if (trackerColor === 'red') {
+            boxColor = '#ef4444';
+            bgColor = '#ef4444';
+            textColor = '#ffffff';
+          } else if (trackerColor === 'green') {
+            boxColor = '#22c55e';
+            bgColor = '#22c55e';
+            textColor = '#ffffff';
+          } else {
+            // person identified → teal; no id yet → yellow (Unknown)
+            boxColor = person_id ? '#1f8a70' : '#f4d35e';
+            bgColor = person_id ? '#1f8a70' : '#f4d35e';
+            textColor = person_id ? '#ffffff' : '#1e2a2f';
+          }
+
           // Draw box
-          ctx.strokeStyle = person_id ? '#1f8a70' : '#f4d35e';
+          ctx.strokeStyle = boxColor;
           ctx.lineWidth = 3;
           ctx.strokeRect(x, y, w, h);
 
-          // Draw label background
-          const label = person_id ? `ID: ${person_id}` : `Tracking...`;
+          // Draw color indicator circle on top of bbox (person's head area)
+          if (trackerColor) {
+            const circleX = x + w / 2;
+            const circleY = y + 15;
+            const circleRadius = 12;
+
+            // Draw circle shadow
+            ctx.shadowColor = 'rgba(0, 0, 0, 0.3)';
+            ctx.shadowBlur = 4;
+            ctx.shadowOffsetX = 0;
+            ctx.shadowOffsetY = 2;
+
+            // Draw circle
+            ctx.fillStyle = trackerColor === 'red' ? '#ef4444' : '#22c55e';
+            ctx.beginPath();
+            ctx.arc(circleX, circleY, circleRadius, 0, 2 * Math.PI);
+            ctx.fill();
+
+            // Reset shadow
+            ctx.shadowColor = 'transparent';
+            ctx.shadowBlur = 0;
+            ctx.shadowOffsetX = 0;
+            ctx.shadowOffsetY = 0;
+
+            // Draw white border around circle
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.arc(circleX, circleY, circleRadius, 0, 2 * Math.PI);
+            ctx.stroke();
+          }
+
+          // Draw label — "Unknown" for unidentified faces (was "Tracking...")
+          const label = person_id ? `ID: ${person_id}` : `Unknown`;
           ctx.font = 'bold 16px Montserrat, sans-serif';
           const textMetrics = ctx.measureText(label);
           const textHeight = 24;
 
-          ctx.fillStyle = person_id ? '#1f8a70' : '#f4d35e';
+          ctx.fillStyle = bgColor;
           ctx.fillRect(x, y - textHeight - 4, textMetrics.width + 12, textHeight);
 
           // Draw label text
-          ctx.fillStyle = person_id ? '#ffffff' : '#1e2a2f';
+          ctx.fillStyle = textColor;
           ctx.fillText(label, x + 6, y - 10);
         });
 
@@ -144,8 +297,12 @@ export default function LiveTrackerDashboard() {
     setupNats();
 
     return () => {
+      cancelled = true;
+      colorTimeoutsRef.current.forEach(timeout => clearTimeout(timeout));
+      colorTimeoutsRef.current.clear();
       if (nc) nc.close();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
@@ -163,7 +320,7 @@ export default function LiveTrackerDashboard() {
               </div>
               <div>
                 <h1 className="text-2xl font-bold text-foreground">eCorridor</h1>
-                <p className="text-sm text-muted">Live Tracker Dashboard</p>
+                <p className="text-sm text-muted">Operator Dashboard</p>
               </div>
             </div>
 
@@ -182,6 +339,15 @@ export default function LiveTrackerDashboard() {
                   }`}></div>
                 {status === 'connected' ? 'Connected' : status === 'error' ? 'Error' : 'Connecting...'}
               </div>
+              <a
+                href="/traveller"
+                className="flex items-center gap-2 rounded-full px-4 py-2 text-sm font-medium bg-primary-soft text-primary hover:bg-primary hover:text-white transition-colors"
+              >
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
+                </svg>
+                Traveller View
+              </a>
             </div>
           </div>
         </div>
@@ -190,93 +356,136 @@ export default function LiveTrackerDashboard() {
       {/* Main Content */}
       <div className="container mx-auto px-6 py-6">
         <div className="grid gap-6 lg:grid-cols-[1fr_380px]">
-          {/* Video Feed */}
+          {/* Camera Feeds */}
           <div className="space-y-4">
-            <div className="rounded-lg bg-card p-1 shadow-panel">
-              <div className="relative overflow-hidden rounded-md bg-black">
-                <canvas
-                  ref={canvasRef}
-                  className="w-full h-auto"
-                  style={{ maxHeight: 'calc(100vh - 240px)' }}
-                />
-                {status !== 'connected' && (
+            {cameraIds.length === 0 ? (
+              /* Waiting placeholder */
+              <div className="rounded-lg bg-card p-1 shadow-panel">
+                <div className="relative overflow-hidden rounded-md bg-black" style={{ minHeight: 360 }}>
                   <div className="absolute inset-0 flex items-center justify-center bg-black/80">
                     <div className="text-center">
                       <div className="mb-4 inline-flex h-16 w-16 items-center justify-center rounded-full bg-primary/20">
                         {status === 'connecting' ? (
                           <div className="h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent"></div>
-                        ) : (
+                        ) : status === 'error' ? (
                           <svg className="h-8 w-8 text-destructive" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                          </svg>
+                        ) : (
+                          <svg className="h-8 w-8 text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
                           </svg>
                         )}
                       </div>
                       <p className="text-lg font-semibold text-white">
-                        {status === 'connecting' ? 'Connecting to stream...' : 'Connection Error'}
+                        {status === 'connecting' ? 'Connecting to stream...' : status === 'error' ? 'Connection Error' : 'Waiting for cameras...'}
                       </p>
-                      {errorMessage && (
-                        <p className="mt-2 text-sm text-gray-400">{errorMessage}</p>
-                      )}
+                      {errorMessage && <p className="mt-2 text-sm text-gray-400">{errorMessage}</p>}
                     </div>
                   </div>
-                )}
+                </div>
               </div>
-            </div>
+            ) : (
+              <div className={`grid gap-4 ${cameraIds.length > 1 ? 'grid-cols-2' : 'grid-cols-1'}`}>
+                {cameraIds.map(cameraId => {
+                  const meta = cameraMeta.get(cameraId);
+                  return (
+                    <div key={cameraId} className="space-y-2">
+                      <div className="flex items-center gap-2 px-1">
+                        <div className="h-2 w-2 rounded-full bg-success animate-pulse"></div>
+                        <span className="text-sm font-semibold text-foreground">Camera: {cameraId}</span>
+                        {meta && (
+                          <span className="ml-auto text-xs text-muted">
+                            Frame #{meta.frame_id.toLocaleString()} · {meta.faces} face{meta.faces !== 1 ? 's' : ''}
+                          </span>
+                        )}
+                      </div>
+                      <div className="rounded-lg bg-card p-1 shadow-panel">
+                        <div className="relative overflow-hidden rounded-md bg-black">
+                          <canvas
+                            ref={el => registerCanvas(cameraId, el)}
+                            className="w-full h-auto"
+                            style={{ maxHeight: cameraIds.length > 1 ? 'calc(50vh - 120px)' : 'calc(100vh - 240px)' }}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
 
-            {/* Stream Info */}
-            <div className="grid grid-cols-3 gap-4">
-              <div className="rounded-lg bg-card p-4 shadow-sm border border-border">
-                <div className="flex items-center gap-3">
-                  <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary-soft">
-                    <svg className="h-5 w-5 text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                    </svg>
+            {/* Aggregate Stats */}
+            {cameraIds.length > 0 && (
+              <div className="grid grid-cols-3 gap-4">
+                <div className="rounded-lg bg-card p-4 shadow-sm border border-border">
+                  <div className="flex items-center gap-3">
+                    <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary-soft">
+                      <svg className="h-5 w-5 text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                      </svg>
+                    </div>
+                    <div>
+                      <p className="text-xs font-medium text-muted">Cameras</p>
+                      <p className="text-lg font-semibold text-foreground">{cameraIds.length}</p>
+                    </div>
                   </div>
-                  <div>
-                    <p className="text-xs font-medium text-muted">Camera ID</p>
-                    <p className="text-lg font-semibold text-foreground">{meta.camera_id || 'N/A'}</p>
+                </div>
+
+                <div className="rounded-lg bg-card p-4 shadow-sm border border-border">
+                  <div className="flex items-center gap-3">
+                    <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-accent-soft">
+                      <svg className="h-5 w-5 text-warning" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 4v16M17 4v16M3 8h4m10 0h4M3 12h18M3 16h4m10 0h4M4 20h16a1 1 0 001-1V5a1 1 0 00-1-1H4a1 1 0 00-1 1v14a1 1 0 001 1z" />
+                      </svg>
+                    </div>
+                    <div>
+                      <p className="text-xs font-medium text-muted">Total Frames</p>
+                      <p className="text-lg font-semibold text-foreground">
+                        {Array.from(cameraMeta.values()).reduce((s, m) => s + m.frame_id, 0).toLocaleString()}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="rounded-lg bg-card p-4 shadow-sm border border-border">
+                  <div className="flex items-center gap-3">
+                    <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-success-soft">
+                      <svg className="h-5 w-5 text-success" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
+                      </svg>
+                    </div>
+                    <div>
+                      <p className="text-xs font-medium text-muted">Detections</p>
+                      <p className="text-lg font-semibold text-foreground">
+                        {Array.from(cameraMeta.values()).reduce((s, m) => s + m.faces, 0)}
+                      </p>
+                    </div>
                   </div>
                 </div>
               </div>
-
-              <div className="rounded-lg bg-card p-4 shadow-sm border border-border">
-                <div className="flex items-center gap-3">
-                  <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-accent-soft">
-                    <svg className="h-5 w-5 text-warning" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 4v16M17 4v16M3 8h4m10 0h4M3 12h18M3 16h4m10 0h4M4 20h16a1 1 0 001-1V5a1 1 0 00-1-1H4a1 1 0 00-1 1v14a1 1 0 001 1z" />
-                    </svg>
-                  </div>
-                  <div>
-                    <p className="text-xs font-medium text-muted">Frame</p>
-                    <p className="text-lg font-semibold text-foreground">{meta.frame_id.toLocaleString()}</p>
-                  </div>
-                </div>
-              </div>
-
-              <div className="rounded-lg bg-card p-4 shadow-sm border border-border">
-                <div className="flex items-center gap-3">
-                  <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-success-soft">
-                    <svg className="h-5 w-5 text-success" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
-                    </svg>
-                  </div>
-                  <div>
-                    <p className="text-xs font-medium text-muted">Detections</p>
-                    <p className="text-lg font-semibold text-foreground">{meta.faces}</p>
-                  </div>
-                </div>
-              </div>
-            </div>
+            )}
           </div>
 
-          {/* Sidebar - Recent Matches */}
+          {/* Sidebar - Recent Identifications */}
           <div className="space-y-4">
             <div className="rounded-lg bg-card p-5 shadow-panel border border-border">
               <div className="mb-4 flex items-center justify-between">
                 <h2 className="text-lg font-semibold text-foreground">Recent Identifications</h2>
-                <span className="flex h-6 w-6 items-center justify-center rounded-full bg-primary text-xs font-bold text-primary-foreground">
-                  {recentMatches.length}
-                </span>
+                <div className="flex items-center gap-2">
+                  <span className="flex h-6 w-6 items-center justify-center rounded-full bg-primary text-xs font-bold text-primary-foreground">
+                    {recentMatches.length}
+                  </span>
+                  {recentMatches.length > 0 && (
+                    <button
+                      onClick={() => { setRecentMatches([]); localStorage.removeItem(LS_MATCHES_KEY); }}
+                      className="text-xs text-muted hover:text-destructive transition-colors"
+                      title="Clear history"
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
               </div>
 
               <div className="space-y-3 max-h-[calc(100vh-280px)] overflow-y-auto pr-2">
@@ -291,37 +500,65 @@ export default function LiveTrackerDashboard() {
                     <p className="mt-1 text-xs text-muted/70">Matches will appear here</p>
                   </div>
                 ) : (
-                  recentMatches.map((match, idx) => (
-                    <div
-                      key={`${match.tracker_id}-${idx}`}
-                      className="group rounded-lg border border-border bg-background-secondary p-3 transition-all hover:border-primary hover:shadow-md"
-                    >
-                      <div className="flex items-start gap-3">
-                        <div className="relative h-16 w-16 flex-shrink-0 overflow-hidden rounded-lg border-2 border-primary">
-                          <img
-                            src={match.image}
-                            alt={`Person ${match.id}`}
-                            className="h-full w-full object-cover"
-                          />
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-start justify-between gap-2">
-                            <p className="font-semibold text-foreground truncate">ID: {match.id}</p>
-                            <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${parseFloat(match.score) >= 80
-                              ? 'bg-success-soft text-success'
-                              : parseFloat(match.score) >= 60
-                                ? 'bg-warning-soft text-warning'
-                                : 'bg-destructive-soft text-destructive'
-                              }`}>
-                              {match.score}%
-                            </span>
+                  recentMatches.map((match) => {
+                    const trackerColor = trackerColors.get(match.tracker_id);
+                    return (
+                      <div
+                        key={match.id}
+                        className="group rounded-lg border bg-background-secondary p-3 transition-all hover:shadow-md"
+                        style={{
+                          borderColor: trackerColor === 'red' ? '#ef4444' : trackerColor === 'green' ? '#22c55e' : undefined
+                        }}
+                      >
+                        <div className="flex items-start gap-3">
+                          <div className="relative h-16 w-16 flex-shrink-0 overflow-hidden rounded-lg border-2"
+                            style={{
+                              borderColor: trackerColor === 'red' ? '#ef4444' : trackerColor === 'green' ? '#22c55e' : '#1f8a70'
+                            }}>
+                            {match.image ? (
+                              <img src={match.image} alt={`Person ${match.id}`} className="h-full w-full object-cover" />
+                            ) : (
+                              <div className="h-full w-full flex items-center justify-center bg-muted/20">
+                                <svg className="h-6 w-6 text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
+                                </svg>
+                              </div>
+                            )}
+                            {trackerColor && (
+                              <div className="absolute -top-1 -right-1 h-5 w-5 rounded-full border-2 border-white shadow-md"
+                                style={{ backgroundColor: trackerColor === 'red' ? '#ef4444' : '#22c55e' }}>
+                              </div>
+                            )}
                           </div>
-                          <p className="mt-1 text-xs text-muted">Tracker #{match.tracker_id}</p>
-                          <p className="mt-0.5 text-xs text-muted">{match.time}</p>
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="flex items-center gap-2">
+                                <p className="font-semibold text-foreground truncate">ID: {match.id}</p>
+                                {trackerColor && (
+                                  <span className="flex items-center gap-1 text-xs font-semibold"
+                                    style={{ color: trackerColor === 'red' ? '#ef4444' : '#22c55e' }}>
+                                    <span className="h-2 w-2 rounded-full"
+                                      style={{ backgroundColor: trackerColor === 'red' ? '#ef4444' : '#22c55e' }}></span>
+                                    {trackerColor.toUpperCase()}
+                                  </span>
+                                )}
+                              </div>
+                              <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${parseFloat(match.score) >= 80
+                                ? 'bg-success-soft text-success'
+                                : parseFloat(match.score) >= 60
+                                  ? 'bg-warning-soft text-warning'
+                                  : 'bg-destructive-soft text-destructive'
+                                }`}>
+                                {match.score}%
+                              </span>
+                            </div>
+                            <p className="mt-1 text-xs text-muted">Tracker #{match.tracker_id}</p>
+                            <p className="mt-0.5 text-xs text-muted">{match.time}</p>
+                          </div>
                         </div>
                       </div>
-                    </div>
-                  ))
+                    );
+                  })
                 )}
               </div>
             </div>
@@ -337,7 +574,7 @@ export default function LiveTrackerDashboard() {
                 <div className="flex-1">
                   <p className="text-sm font-medium text-foreground">NATS Stream</p>
                   <p className="mt-1 text-xs text-muted">ws://172.20.30.140:7777</p>
-                  <p className="mt-2 text-xs text-muted/70">Topics: frames.tracker, frames.matches</p>
+                  <p className="mt-2 text-xs text-muted/70">Topics: frames.tracker · frames.matches · frames.color</p>
                 </div>
               </div>
             </div>
