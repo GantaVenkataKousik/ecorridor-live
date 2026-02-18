@@ -203,8 +203,11 @@ export default function LiveTrackerDashboard() {
 
       const img = new Image();
 
-      const blob = new Blob([new Uint8Array(data.image as any)], { type: 'image/jpeg' });
-      const url = URL.createObjectURL(blob);
+      const base64 = btoa(
+        new Uint8Array(data.image as any)
+          .reduce((data, byte) => data + String.fromCharCode(byte), '')
+      );
+      img.src = `data:image/jpeg;base64,${base64}`;
 
       img.onload = () => {
         if (canvas.width !== img.width) {
@@ -288,10 +291,7 @@ export default function LiveTrackerDashboard() {
           ctx.fillStyle = textColor;
           ctx.fillText(label, x + 6, y - 10);
         });
-
-        URL.revokeObjectURL(url);
       };
-      img.src = url;
     }
 
     setupNats();

@@ -53,8 +53,11 @@ export default function TravellerView() {
       if (!ctx) return;
 
       const img = new Image();
-      const blob = new Blob([new Uint8Array(data.image as any)], { type: 'image/jpeg' });
-      const url = URL.createObjectURL(blob);
+      const base64 = btoa(
+        new Uint8Array(data.image as any)
+          .reduce((data, byte) => data + String.fromCharCode(byte), '')
+      );
+      img.src = `data:image/jpeg;base64,${base64}`;
 
       img.onload = () => {
         if (canvas.width !== img.width) {
@@ -62,9 +65,7 @@ export default function TravellerView() {
           canvas.height = img.height;
         }
         ctx.drawImage(img, 0, 0);
-        URL.revokeObjectURL(url);
       };
-      img.src = url;
     }
 
     async function setupNats() {
