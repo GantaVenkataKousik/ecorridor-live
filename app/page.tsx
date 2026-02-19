@@ -1,8 +1,11 @@
 "use client";
 
 import React, { useEffect, useState, useRef, useCallback } from 'react';
+import Link from 'next/link';
 import { connect } from 'nats.ws';
 import { decode } from '@msgpack/msgpack';
+
+/* ─── Types ────────────────────────────────────────────────────────────── */
 
 interface TrackedFace {
   person_id?: string;
@@ -27,7 +30,7 @@ interface MatchData {
 
 interface RecentMatch {
   id: string;
-  image: string;
+  image: string;        // compressed base64 data-URL — never blob
   score: string;
   time: string;
   tracker_id: number;
@@ -38,96 +41,93 @@ interface ColorMessage {
   tracker_id?: number;
 }
 
-const LS_MATCHES_KEY = 'ecorridor_recent_matches';
-const LS_CAMERAS_KEY = 'ecorridor_camera_ids';
+/* ─── Storage ──────────────────────────────────────────────────────────── */
+const SS_MATCHES_KEY  = 'ecorridor_recent_matches';
+const SS_CAMERAS_KEY  = 'ecorridor_camera_ids';
+const MAX_MATCHES     = 50;
 
-function loadMatchesFromStorage(): RecentMatch[] {
+function loadFromSession<T>(key: string, fallback: T): T {
   try {
-    const raw = localStorage.getItem(LS_MATCHES_KEY);
-    if (!raw) return [];
-    return JSON.parse(raw) as RecentMatch[];
-  } catch {
-    return [];
-  }
+    const raw = sessionStorage.getItem(key);
+    if (!raw) return fallback;
+    return JSON.parse(raw) as T;
+  } catch { return fallback; }
 }
 
-function loadCameraIdsFromStorage(): string[] {
-  try {
-    const raw = localStorage.getItem(LS_CAMERAS_KEY);
-    if (!raw) return [];
-    return JSON.parse(raw) as string[];
-  } catch {
-    return [];
-  }
+function saveToSession(key: string, value: unknown) {
+  try { sessionStorage.setItem(key, JSON.stringify(value)); } catch { /* quota */ }
 }
 
-// Save synchronously — called inline so data is never lost before a reload
-function saveMatchesToStorage(matches: RecentMatch[]) {
-  try {
-    const toSave = matches.map(m => ({ ...m, image: '' }));
-    localStorage.setItem(LS_MATCHES_KEY, JSON.stringify(toSave));
-  } catch { /* quota exceeded — ignore */ }
+/* ─── Image compression ───────────────────────────────────────────────── */
+// Resize face crop to ≤96 px thumbnail, JPEG quality 0.6 → ~3-8 KB base64
+function compressImageToBase64(raw: Uint8Array, maxPx = 96): Promise<string> {
+  return new Promise((resolve) => {
+    const blob = new Blob([new Uint8Array(raw)], { type: 'image/jpeg' });
+    const url  = URL.createObjectURL(blob);
+    const img  = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const c   = document.createElement('canvas');
+      const s   = Math.min(maxPx / Math.max(img.width, 1), maxPx / Math.max(img.height, 1), 1);
+      c.width   = Math.max(Math.round(img.width * s), 1);
+      c.height  = Math.max(Math.round(img.height * s), 1);
+      const ctx = c.getContext('2d');
+      if (!ctx) { resolve(''); return; }
+      ctx.drawImage(img, 0, 0, c.width, c.height);
+      resolve(c.toDataURL('image/jpeg', 0.6));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); resolve(''); };
+    img.src = url;
+  });
 }
 
-function saveCameraIdsToStorage(ids: string[]) {
-  try {
-    localStorage.setItem(LS_CAMERAS_KEY, JSON.stringify(ids));
-  } catch { /* ignore */ }
-}
-
+/* ─── Component ────────────────────────────────────────────────────────── */
 export default function LiveTrackerDashboard() {
-  const [status, setStatus] = useState<'connecting' | 'connected' | 'error'>('connecting');
+  /* ── Connection state ─────────────────────────────────────────── */
+  const [status, setStatus]           = useState<'connecting' | 'connected' | 'reconnecting' | 'error'>('connecting');
   const [errorMessage, setErrorMessage] = useState('');
-  // Per-camera metadata: camera_id → { frame_id, faces }
+
+  /* ── Camera state ─────────────────────────────────────────────── */
   const [cameraMeta, setCameraMeta] = useState<Map<string, { frame_id: number; faces: number }>>(new Map());
-  // Ordered list of discovered camera IDs for layout
-  const [cameraIds, setCameraIds] = useState<string[]>(() => loadCameraIdsFromStorage());
-  // Per-camera canvas refs
-  const canvasRefs = useRef<Map<string, HTMLCanvasElement>>(new Map());
-  // Expanded camera (click to zoom)
-  const [expandedCamera, setExpandedCamera] = useState<string | null>(null);
-  const expandedCameraRef = useRef<string | null>(null);
-  const expandedCanvasRef = useRef<HTMLCanvasElement>(null);
-  // Track the last rendered base64 per camera so we can repaint onto expanded canvas
-  const lastFrameRef = useRef<Map<string, string>>(new Map());
+  const [cameraIds, setCameraIds]   = useState<string[]>(() => loadFromSession<string[]>(SS_CAMERAS_KEY, []));
 
-  const [recentMatches, setRecentMatches] = useState<RecentMatch[]>(() => loadMatchesFromStorage());
-  // Keep a ref to matches so beforeunload can read current value
+  const canvasRefs      = useRef<Map<string, HTMLCanvasElement>>(new Map());
+  const lastFrameRef    = useRef<Map<string, string>>(new Map());
+
+  /* ── Expand state — inline (not modal) ────────────────────────── */
+  const [expandedCamera, setExpandedCamera]   = useState<string | null>(null);
+  const expandedCameraRef  = useRef<string | null>(null);
+  const expandedCanvasRef  = useRef<HTMLCanvasElement>(null);
+
+  /* ── Matches ──────────────────────────────────────────────────── */
+  const [recentMatches, setRecentMatches] = useState<RecentMatch[]>(() => loadFromSession<RecentMatch[]>(SS_MATCHES_KEY, []));
   const recentMatchesRef = useRef<RecentMatch[]>(recentMatches);
-  // Keep tracker colors in a ref so renderToCanvas always reads fresh values without stale closure
-  const trackerColorsRef = useRef<Map<number, string>>(new Map());
+
+  /* ── Tracker colours ──────────────────────────────────────────── */
+  const trackerColorsRef  = useRef<Map<number, string>>(new Map());
   const [trackerColors, setTrackerColors] = useState<Map<number, string>>(new Map());
-  const colorTimeoutsRef = useRef<Map<number, NodeJS.Timeout>>(new Map());
+  const colorTimeoutsRef  = useRef<Map<number, NodeJS.Timeout>>(new Map());
 
-  // Keep refs in sync
-  useEffect(() => {
-    recentMatchesRef.current = recentMatches;
-  }, [recentMatches]);
+  /* ── Keep refs in sync ────────────────────────────────────────── */
+  useEffect(() => { recentMatchesRef.current = recentMatches; }, [recentMatches]);
+  useEffect(() => { expandedCameraRef.current = expandedCamera; }, [expandedCamera]);
+  useEffect(() => { trackerColorsRef.current = trackerColors; }, [trackerColors]);
 
+  /* ── Flush state to sessionStorage on unload ──────────────────── */
   useEffect(() => {
-    expandedCameraRef.current = expandedCamera;
-  }, [expandedCamera]);
-
-  // Safety-net: flush to localStorage if the page unloads for any reason
-  useEffect(() => {
-    const onUnload = () => saveMatchesToStorage(recentMatchesRef.current);
-    window.addEventListener('beforeunload', onUnload);
-    return () => window.removeEventListener('beforeunload', onUnload);
+    const flush = () => saveToSession(SS_MATCHES_KEY, recentMatchesRef.current);
+    window.addEventListener('beforeunload', flush);
+    return () => window.removeEventListener('beforeunload', flush);
   }, []);
 
-  // Keep trackerColorsRef in sync so canvas renderer always reads fresh values
-  useEffect(() => {
-    trackerColorsRef.current = trackerColors;
-  }, [trackerColors]);
-
-  // ESC to close expanded camera
+  /* ── ESC to collapse expanded camera ──────────────────────────── */
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setExpandedCamera(null); };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
-  // When a camera is expanded, repaint its last frame immediately onto the expanded canvas
+  /* ── Repaint expanded canvas when switching cameras ────────────── */
   useEffect(() => {
     if (!expandedCamera || !expandedCanvasRef.current) return;
     const src = lastFrameRef.current.get(expandedCamera);
@@ -136,11 +136,7 @@ export default function LiveTrackerDashboard() {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     const img = new Image();
-    img.onload = () => {
-      canvas.width = img.width;
-      canvas.height = img.height;
-      ctx.drawImage(img, 0, 0);
-    };
+    img.onload = () => { canvas.width = img.width; canvas.height = img.height; ctx.drawImage(img, 0, 0); };
     img.src = src;
   }, [expandedCamera]);
 
@@ -149,141 +145,152 @@ export default function LiveTrackerDashboard() {
     else canvasRefs.current.delete(cameraId);
   }, []);
 
+  /* ══════════════════════════════════════════════════════════════════
+     NATS connection with auto-reconnect — NEVER triggers page reload
+     ══════════════════════════════════════════════════════════════════ */
   useEffect(() => {
-    let nc: any;
-    let cancelled = false;
+    let cancelled  = false;
+    let reconnectDelay = 1000;
+    const MAX_DELAY = 30000;
 
-    async function setupNats() {
-      try {
-        nc = await connect({
-          servers: ["ws://172.20.30.140:7777"],
-          waitOnFirstConnect: true
-        });
-        if (cancelled) { nc.close(); return; }
-        setStatus('connected');
+    async function connectLoop() {
+      while (!cancelled) {
+        let nc: any = null;
+        try {
+          setStatus('connecting');
+          setErrorMessage('');
 
-        // ── frames.color ──────────────────────────────────────────────
-        const colorSub = nc.subscribe("frames.color");
-        (async () => {
-          for await (const m of colorSub) {
-            const colorData = decode(m.data) as ColorMessage;
-            const trackerId = colorData.tracker_id;
-            const color = colorData.colorCode.toLowerCase();
+          nc = await connect({
+            servers: ["ws://172.20.30.140:7777"],
+            reconnect: true,
+            maxReconnectAttempts: -1,
+            reconnectTimeWait: 2000,
+          });
 
-            if (trackerId !== undefined) {
-              setTrackerColors(prev => {
-                const newMap = new Map(prev);
-                newMap.set(trackerId, color);
-                return newMap;
-              });
+          if (cancelled) { nc.close(); return; }
+          setStatus('connected');
+          reconnectDelay = 1000; // reset
+
+          /* ── frames.color ──────────────────────────────────────── */
+          const colorSub = nc.subscribe("frames.color");
+          (async () => {
+            for await (const m of colorSub) {
+              if (cancelled) return;
+              const colorData = decode(m.data) as ColorMessage;
+              const trackerId = colorData.tracker_id;
+              const color     = colorData.colorCode.toLowerCase();
+              if (trackerId === undefined) continue;
+
+              setTrackerColors(prev => { const n = new Map(prev); n.set(trackerId, color); return n; });
 
               if (color === 'red') {
-                if (colorTimeoutsRef.current.has(trackerId)) {
+                if (colorTimeoutsRef.current.has(trackerId))
                   clearTimeout(colorTimeoutsRef.current.get(trackerId)!);
-                }
-                const timeoutId = setTimeout(() => {
-                  setTrackerColors(prev => {
-                    const newMap = new Map(prev);
-                    newMap.set(trackerId, 'green');
-                    return newMap;
-                  });
+                const tid = setTimeout(() => {
+                  setTrackerColors(prev => { const n = new Map(prev); n.set(trackerId, 'green'); return n; });
                   colorTimeoutsRef.current.delete(trackerId);
                 }, 5000);
-                colorTimeoutsRef.current.set(trackerId, timeoutId);
+                colorTimeoutsRef.current.set(trackerId, tid);
               }
             }
-          }
-        })();
+          })();
 
-        // ── frames.matches ────────────────────────────────────────────
-        const matchSub = nc.subscribe("frames.matches");
-        (async () => {
-          for await (const m of matchSub) {
-            const matchData = decode(m.data) as MatchData;
+          /* ── frames.matches — compressed base64 images ─────────── */
+          const matchSub = nc.subscribe("frames.matches");
+          (async () => {
+            for await (const m of matchSub) {
+              if (cancelled) return;
+              const matchData = decode(m.data) as MatchData;
 
-            const blob = new Blob([new Uint8Array(matchData.face_crop as any)], { type: 'image/jpeg' });
-            const cropUrl = URL.createObjectURL(blob);
+              // Compress face crop → small base64 thumbnail (never blob URL)
+              const thumb = await compressImageToBase64(matchData.face_crop as unknown as Uint8Array);
 
-            setRecentMatches(prev => {
-              const existingIdx = prev.findIndex(p => p.id === matchData.person_id);
-              const entry: RecentMatch = {
-                id: matchData.person_id,
-                image: cropUrl,
-                score: (matchData.score * 100).toFixed(1),
-                time: new Date().toLocaleTimeString(),
-                tracker_id: matchData.tracker_id
-              };
-              let next: RecentMatch[];
-              if (existingIdx !== -1) {
-                next = [...prev];
-                next[existingIdx] = entry;
-              } else {
-                next = [entry, ...prev].slice(0, 20);
-              }
-              // Save synchronously right here — don't rely on useEffect timing
-              saveMatchesToStorage(next);
-              return next;
-            });
-          }
-        })();
+              setRecentMatches(prev => {
+                const entry: RecentMatch = {
+                  id:         matchData.person_id,
+                  image:      thumb,
+                  score:      (matchData.score * 100).toFixed(1),
+                  time:       new Date().toLocaleTimeString(),
+                  tracker_id: matchData.tracker_id,
+                };
+                const existingIdx = prev.findIndex(p => p.id === matchData.person_id);
+                let next: RecentMatch[];
+                if (existingIdx !== -1) {
+                  // Same person → update image + move to top
+                  next = [entry, ...prev.filter((_, i) => i !== existingIdx)];
+                } else {
+                  next = [entry, ...prev];
+                }
+                next = next.slice(0, MAX_MATCHES);
+                // Persist synchronously with images included
+                saveToSession(SS_MATCHES_KEY, next);
+                return next;
+              });
+            }
+          })();
 
-        // ── frames.tracker ─────────────────────────────────────────────
-        const trackerSub = nc.subscribe("frames.tracker");
-        (async () => {
-          for await (const m of trackerSub) {
-            const data = decode(m.data) as TrackerData;
+          /* ── frames.tracker ────────────────────────────────────── */
+          const trackerSub = nc.subscribe("frames.tracker");
+          (async () => {
+            for await (const m of trackerSub) {
+              if (cancelled) return;
+              const data = decode(m.data) as TrackerData;
 
-            // Register new cameras and persist
-            setCameraIds(prev => {
-              if (prev.includes(data.camera_id)) return prev;
-              const next = [...prev, data.camera_id];
-              saveCameraIdsToStorage(next);
-              return next;
-            });
-            setCameraMeta(prev => {
-              const next = new Map(prev);
-              next.set(data.camera_id, { frame_id: data.frame_id, faces: data.tracked_faces?.length || 0 });
-              return next;
-            });
+              setCameraIds(prev => {
+                if (prev.includes(data.camera_id)) return prev;
+                const next = [...prev, data.camera_id];
+                saveToSession(SS_CAMERAS_KEY, next);
+                return next;
+              });
+              setCameraMeta(prev => {
+                const next = new Map(prev);
+                next.set(data.camera_id, { frame_id: data.frame_id, faces: data.tracked_faces?.length || 0 });
+                return next;
+              });
 
-            renderToCanvas(data);
-          }
-        })();
+              renderToCanvas(data);
+            }
+          })();
 
-      } catch (err: any) {
-        if (cancelled) return;
-        console.error("NATS Error:", err);
-        setStatus('error');
-        setErrorMessage(err.message);
+          // Wait until the connection closes (server down, network drop, etc.)
+          await nc.closed();
+          if (cancelled) return;
+
+          // Connection lost — keep all state, just update status
+          setStatus('reconnecting');
+          setErrorMessage('Stream interrupted — reconnecting…');
+        } catch (err: any) {
+          if (cancelled) return;
+          setStatus('reconnecting');
+          setErrorMessage(`Reconnecting in ${Math.round(reconnectDelay / 1000)}s… (${err?.message || 'unknown error'})`);
+        }
+
+        // Exponential back-off
+        if (!cancelled) {
+          await new Promise(r => setTimeout(r, reconnectDelay));
+          reconnectDelay = Math.min(reconnectDelay * 1.5, MAX_DELAY);
+        }
       }
     }
 
     function renderToCanvas(data: TrackerData) {
       const canvas = canvasRefs.current.get(data.camera_id);
       if (!canvas || !data.image) return;
-
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
 
       const img = new Image();
-
       const base64 = btoa(
-        new Uint8Array(data.image as any)
-          .reduce((data, byte) => data + String.fromCharCode(byte), '')
+        new Uint8Array(data.image as any).reduce((d, byte) => d + String.fromCharCode(byte), '')
       );
       img.src = `data:image/jpeg;base64,${base64}`;
-      // Cache last frame so expanded view can repaint it
       lastFrameRef.current.set(data.camera_id, img.src);
 
       img.onload = () => {
-        if (canvas.width !== img.width) {
-          canvas.width = img.width;
-          canvas.height = img.height;
-        }
-
+        if (canvas.width !== img.width) { canvas.width = img.width; canvas.height = img.height; }
         ctx.drawImage(img, 0, 0);
 
-        // If this camera is currently expanded, mirror the frame there too
+        // Mirror to expanded canvas if this camera is expanded
         const expCanvas = expandedCanvasRef.current;
         if (expCanvas && expandedCameraRef.current === data.camera_id) {
           const expCtx = expCanvas.getContext('2d');
@@ -293,97 +300,60 @@ export default function LiveTrackerDashboard() {
           }
         }
 
-        // Draw Bounding Boxes
+        // Draw bounding boxes
         data.tracked_faces?.forEach((face) => {
           const { person_id, bbox, tracker_id } = face;
           const [x, y, w, h] = bbox;
-
-          // Read from ref — always fresh, no stale closure
           const trackerColor = trackerColorsRef.current.get(tracker_id);
-          let boxColor, bgColor, textColor;
+          let boxColor: string, bgColor: string, textColor: string;
 
-          if (trackerColor === 'red') {
-            boxColor = '#ef4444';
-            bgColor = '#ef4444';
-            textColor = '#ffffff';
-          } else if (trackerColor === 'green') {
-            boxColor = '#22c55e';
-            bgColor = '#22c55e';
-            textColor = '#ffffff';
-          } else {
-            // person identified → teal; no id yet → yellow (Unknown)
-            boxColor = person_id ? '#1f8a70' : '#f4d35e';
-            bgColor = person_id ? '#1f8a70' : '#f4d35e';
-            textColor = person_id ? '#ffffff' : '#1e2a2f';
-          }
+          if (trackerColor === 'red')        { boxColor = '#ef4444'; bgColor = '#ef4444'; textColor = '#ffffff'; }
+          else if (trackerColor === 'green')  { boxColor = '#22c55e'; bgColor = '#22c55e'; textColor = '#ffffff'; }
+          else { boxColor = person_id ? '#1f8a70' : '#f4d35e'; bgColor = boxColor; textColor = person_id ? '#ffffff' : '#1e2a2f'; }
 
-          // Draw box
-          ctx.strokeStyle = boxColor;
-          ctx.lineWidth = 3;
+          ctx.strokeStyle = boxColor; ctx.lineWidth = 3;
           ctx.strokeRect(x, y, w, h);
 
-          // Draw color indicator circle on top of bbox (person's head area)
           if (trackerColor) {
-            const circleX = x + w / 2;
-            const circleY = y + 15;
-            const circleRadius = 12;
-
-            // Draw circle shadow
-            ctx.shadowColor = 'rgba(0, 0, 0, 0.3)';
-            ctx.shadowBlur = 4;
-            ctx.shadowOffsetX = 0;
-            ctx.shadowOffsetY = 2;
-
-            // Draw circle
+            const cx2 = x + w / 2, cy2 = y + 15, r = 12;
+            ctx.shadowColor = 'rgba(0,0,0,0.3)'; ctx.shadowBlur = 4; ctx.shadowOffsetY = 2;
             ctx.fillStyle = trackerColor === 'red' ? '#ef4444' : '#22c55e';
-            ctx.beginPath();
-            ctx.arc(circleX, circleY, circleRadius, 0, 2 * Math.PI);
-            ctx.fill();
-
-            // Reset shadow
-            ctx.shadowColor = 'transparent';
-            ctx.shadowBlur = 0;
-            ctx.shadowOffsetX = 0;
-            ctx.shadowOffsetY = 0;
-
-            // Draw white border around circle
-            ctx.strokeStyle = '#ffffff';
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            ctx.arc(circleX, circleY, circleRadius, 0, 2 * Math.PI);
-            ctx.stroke();
+            ctx.beginPath(); ctx.arc(cx2, cy2, r, 0, 2 * Math.PI); ctx.fill();
+            ctx.shadowColor = 'transparent'; ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
+            ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.arc(cx2, cy2, r, 0, 2 * Math.PI); ctx.stroke();
           }
 
-          // Draw label — "Unknown" for unidentified faces (was "Tracking...")
-          const label = person_id ? `ID: ${person_id}` : `Unknown`;
+          const label = person_id ? `ID: ${person_id}` : 'Unknown';
           ctx.font = 'bold 16px Montserrat, sans-serif';
-          const textMetrics = ctx.measureText(label);
-          const textHeight = 24;
-
+          const tw = ctx.measureText(label).width;
           ctx.fillStyle = bgColor;
-          ctx.fillRect(x, y - textHeight - 4, textMetrics.width + 12, textHeight);
-
-          // Draw label text
+          ctx.fillRect(x, y - 28, tw + 12, 24);
           ctx.fillStyle = textColor;
           ctx.fillText(label, x + 6, y - 10);
         });
       };
     }
 
-    setupNats();
+    connectLoop();
 
     return () => {
       cancelled = true;
-      colorTimeoutsRef.current.forEach(timeout => clearTimeout(timeout));
+      colorTimeoutsRef.current.forEach(t => clearTimeout(t));
       colorTimeoutsRef.current.clear();
-      if (nc) nc.close();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  /* ── Derived helpers ──────────────────────────────────────────── */
+  const otherCameras = expandedCamera ? cameraIds.filter(id => id !== expandedCamera) : [];
+
+  /* ══════════════════════════════════════════════════════════════════
+     RENDER
+     ══════════════════════════════════════════════════════════════════ */
   return (
     <div className="min-h-screen bg-background">
-      {/* Header */}
+      {/* ── Header ──────────────────────────────────────────────── */}
       <header className="border-b border-border bg-card shadow-sm">
         <div className="container mx-auto px-6 py-4">
           <div className="flex items-center justify-between">
@@ -401,21 +371,22 @@ export default function LiveTrackerDashboard() {
             </div>
 
             <div className="flex items-center gap-3">
-              <div className={`flex items-center gap-2 rounded-full px-4 py-2 text-sm font-medium ${status === 'connected'
-                ? 'bg-success-soft text-success'
-                : status === 'error'
-                  ? 'bg-destructive-soft text-destructive'
-                  : 'bg-warning-soft text-warning'
-                }`}>
-                <div className={`h-2 w-2 rounded-full ${status === 'connected'
-                  ? 'bg-success animate-pulse'
-                  : status === 'error'
-                    ? 'bg-destructive'
-                    : 'bg-warning animate-pulse'
-                  }`}></div>
-                {status === 'connected' ? 'Connected' : status === 'error' ? 'Error' : 'Connecting...'}
+              {/* Status badge — includes reconnecting state */}
+              <div className={`flex items-center gap-2 rounded-full px-4 py-2 text-sm font-medium ${
+                status === 'connected'    ? 'bg-success-soft text-success'
+                : status === 'reconnecting' ? 'bg-warning-soft text-warning'
+                : status === 'error'        ? 'bg-destructive-soft text-destructive'
+                :                             'bg-warning-soft text-warning'
+              }`}>
+                <div className={`h-2 w-2 rounded-full ${
+                  status === 'connected'    ? 'bg-success animate-pulse'
+                  : status === 'reconnecting' ? 'bg-warning animate-pulse'
+                  : status === 'error'        ? 'bg-destructive'
+                  :                             'bg-warning animate-pulse'
+                }`} />
+                {status === 'connected' ? 'Connected' : status === 'reconnecting' ? 'Reconnecting…' : status === 'error' ? 'Error' : 'Connecting…'}
               </div>
-              <a
+              <Link
                 href="/traveller"
                 className="flex items-center gap-2 rounded-full px-4 py-2 text-sm font-medium bg-primary-soft text-primary hover:bg-primary hover:text-white transition-colors"
               >
@@ -423,26 +394,25 @@ export default function LiveTrackerDashboard() {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
                 </svg>
                 Traveller View
-              </a>
+              </Link>
             </div>
           </div>
         </div>
       </header>
 
-      {/* Main Content */}
+      {/* ── Main Content ────────────────────────────────────────── */}
       <div className="container mx-auto px-6 py-6">
         <div className="grid gap-6 lg:grid-cols-[1fr_380px]">
-          {/* Camera Feeds */}
+          {/* ── Camera Feeds ────────────────────────────────────── */}
           <div className="space-y-4">
             {cameraIds.length === 0 ? (
-              /* Waiting placeholder */
               <div className="rounded-lg bg-card p-1 shadow-panel">
                 <div className="relative overflow-hidden rounded-md bg-black" style={{ minHeight: 360 }}>
                   <div className="absolute inset-0 flex items-center justify-center bg-black/80">
                     <div className="text-center">
                       <div className="mb-4 inline-flex h-16 w-16 items-center justify-center rounded-full bg-primary/20">
-                        {status === 'connecting' ? (
-                          <div className="h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent"></div>
+                        {status === 'connecting' || status === 'reconnecting' ? (
+                          <div className="h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent" />
                         ) : status === 'error' ? (
                           <svg className="h-8 w-8 text-destructive" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
@@ -454,92 +424,121 @@ export default function LiveTrackerDashboard() {
                         )}
                       </div>
                       <p className="text-lg font-semibold text-white">
-                        {status === 'connecting' ? 'Connecting to stream...' : status === 'error' ? 'Connection Error' : 'Waiting for cameras...'}
+                        {status === 'connecting' ? 'Connecting to stream…' : status === 'reconnecting' ? 'Reconnecting…' : status === 'error' ? 'Connection Error' : 'Waiting for cameras…'}
                       </p>
                       {errorMessage && <p className="mt-2 text-sm text-gray-400">{errorMessage}</p>}
                     </div>
                   </div>
                 </div>
               </div>
-            ) : (
-              <>
-                {/* Expanded camera modal */}
-                {expandedCamera && (
-                  <div
-                    className="fixed inset-0 z-50 flex flex-col bg-black/95"
-                    onClick={() => setExpandedCamera(null)}
-                  >
-                    <div className="flex items-center justify-between px-5 py-3 border-b border-white/10">
-                      <div className="flex items-center gap-2">
-                        <div className="h-2 w-2 rounded-full bg-success animate-pulse"></div>
-                        <span className="text-sm font-semibold text-white">Camera: {expandedCamera}</span>
-                        {cameraMeta.get(expandedCamera) && (
-                          <span className="ml-2 text-xs text-white/50">
-                            Frame #{cameraMeta.get(expandedCamera)!.frame_id.toLocaleString()} · {cameraMeta.get(expandedCamera)!.faces} face{cameraMeta.get(expandedCamera)!.faces !== 1 ? 's' : ''}
-                          </span>
-                        )}
-                      </div>
+            ) : expandedCamera ? (
+              /* ── Expanded single-camera view (inline, NOT modal) ── */
+              <div className="space-y-2">
+                {/* Floating mini-thumbnails for other cameras */}
+                {otherCameras.length > 0 && (
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {otherCameras.map(camId => (
                       <button
-                        onClick={e => { e.stopPropagation(); setExpandedCamera(null); }}
-                        className="flex h-8 w-8 items-center justify-center rounded-full bg-white/10 hover:bg-white/20 text-white transition-colors"
+                        key={camId}
+                        onClick={() => setExpandedCamera(camId)}
+                        className="flex items-center gap-2 rounded-lg bg-card border border-border px-3 py-2 text-xs font-medium text-foreground hover:bg-primary-soft hover:text-primary transition-colors shadow-sm"
+                        title={`Switch to ${camId}`}
                       >
-                        ✕
+                        <div className="h-2 w-2 rounded-full bg-success animate-pulse" />
+                        <span>Camera: {camId}</span>
                       </button>
-                    </div>
-                    <div className="flex-1 flex items-center justify-center p-4" onClick={e => e.stopPropagation()}>
-                      <canvas
-                        ref={expandedCanvasRef}
-                        className="max-w-full max-h-full rounded-lg"
-                        style={{ maxHeight: 'calc(100vh - 80px)' }}
-                      />
-                    </div>
+                    ))}
+                    <button
+                      onClick={() => setExpandedCamera(null)}
+                      className="flex items-center gap-2 rounded-lg bg-primary text-white px-3 py-2 text-xs font-medium hover:bg-primary-hover transition-colors shadow-sm"
+                      title="Show all cameras"
+                    >
+                      <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zm10 0a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zm10 0a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
+                      </svg>
+                      Show All
+                    </button>
                   </div>
                 )}
 
-                {/* Camera grid */}
-                <div className={`grid gap-4 ${cameraIds.length > 1 ? 'grid-cols-2' : 'grid-cols-1'}`}>
-                  {cameraIds.map(cameraId => {
-                    const meta = cameraMeta.get(cameraId);
-                    return (
-                      <div key={cameraId} className="space-y-2">
-                        <div className="flex items-center gap-2 px-1">
-                          <div className="h-2 w-2 rounded-full bg-success animate-pulse"></div>
-                          <span className="text-sm font-semibold text-foreground">Camera: {cameraId}</span>
-                          {meta && (
-                            <span className="ml-auto text-xs text-muted">
-                              Frame #{meta.frame_id.toLocaleString()} · {meta.faces} face{meta.faces !== 1 ? 's' : ''}
-                            </span>
-                          )}
-                        </div>
-                        <div
-                          className="rounded-lg bg-card p-1 shadow-panel cursor-pointer group"
-                          onClick={() => setExpandedCamera(cameraId)}
-                          title="Click to expand"
-                        >
-                          <div className="relative overflow-hidden rounded-md bg-black">
-                            <canvas
-                              ref={el => registerCanvas(cameraId, el)}
-                              className="w-full h-auto"
-                              style={{ maxHeight: cameraIds.length > 1 ? 'calc(50vh - 120px)' : 'calc(100vh - 240px)' }}
-                            />
-                            {/* Expand hint on hover */}
-                            <div className="absolute inset-0 flex items-center justify-center bg-black/0 group-hover:bg-black/20 transition-all pointer-events-none">
-                              <div className="opacity-0 group-hover:opacity-100 transition-opacity bg-black/60 rounded-full p-2">
-                                <svg className="h-6 w-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
-                                </svg>
-                              </div>
+                {/* Expanded camera header */}
+                <div className="flex items-center gap-2 px-1">
+                  <div className="h-2 w-2 rounded-full bg-success animate-pulse" />
+                  <span className="text-sm font-semibold text-foreground">Camera: {expandedCamera}</span>
+                  {cameraMeta.get(expandedCamera) && (
+                    <span className="ml-auto text-xs text-muted">
+                      Frame #{cameraMeta.get(expandedCamera)!.frame_id.toLocaleString()} · {cameraMeta.get(expandedCamera)!.faces} face{cameraMeta.get(expandedCamera)!.faces !== 1 ? 's' : ''}
+                    </span>
+                  )}
+                  {otherCameras.length === 0 && (
+                    <button onClick={() => setExpandedCamera(null)} className="ml-auto text-xs text-muted hover:text-foreground transition-colors">
+                      ✕ Collapse
+                    </button>
+                  )}
+                </div>
+
+                {/* Full-width canvas */}
+                <div className="rounded-lg bg-card p-1 shadow-panel">
+                  <div className="relative overflow-hidden rounded-md bg-black">
+                    <canvas
+                      ref={expandedCanvasRef}
+                      className="w-full h-auto block"
+                      style={{ maxHeight: 'calc(100vh - 280px)' }}
+                    />
+                  </div>
+                </div>
+              </div>
+            ) : (
+              /* ── Normal camera grid ────────────────────────────── */
+              <div className={`grid gap-4 ${cameraIds.length > 1 ? 'grid-cols-2' : 'grid-cols-1'}`}>
+                {cameraIds.map(cameraId => {
+                  const meta = cameraMeta.get(cameraId);
+                  return (
+                    <div key={cameraId} className="space-y-2">
+                      <div className="flex items-center gap-2 px-1">
+                        <div className="h-2 w-2 rounded-full bg-success animate-pulse" />
+                        <span className="text-sm font-semibold text-foreground">Camera: {cameraId}</span>
+                        {meta && (
+                          <span className="ml-auto text-xs text-muted">
+                            Frame #{meta.frame_id.toLocaleString()} · {meta.faces} face{meta.faces !== 1 ? 's' : ''}
+                          </span>
+                        )}
+                      </div>
+                      <div
+                        className="rounded-lg bg-card p-1 shadow-panel cursor-pointer group"
+                        onClick={() => setExpandedCamera(cameraId)}
+                        title="Click to expand"
+                      >
+                        <div className="relative overflow-hidden rounded-md bg-black">
+                          <canvas
+                            ref={el => registerCanvas(cameraId, el)}
+                            className="w-full h-auto"
+                            style={{ maxHeight: cameraIds.length > 1 ? 'calc(50vh - 120px)' : 'calc(100vh - 240px)' }}
+                          />
+                          <div className="absolute inset-0 flex items-center justify-center bg-black/0 group-hover:bg-black/20 transition-all pointer-events-none">
+                            <div className="opacity-0 group-hover:opacity-100 transition-opacity bg-black/60 rounded-full p-2">
+                              <svg className="h-6 w-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
+                              </svg>
                             </div>
                           </div>
                         </div>
                       </div>
-                    );
-                  })}
-                </div>
-              </>
+                    </div>
+                  );
+                })}
+              </div>
             )}
 
-            {/* Aggregate Stats */}
+            {/* ── Reconnecting banner (non-intrusive, no refresh) ── */}
+            {(status === 'reconnecting' || (status === 'error' && cameraIds.length > 0)) && (
+              <div className="flex items-center gap-3 rounded-lg border border-warning/30 bg-warning-soft px-4 py-3 text-sm text-warning">
+                <div className="h-4 w-4 animate-spin rounded-full border-2 border-warning border-t-transparent shrink-0" />
+                <span>{errorMessage || 'Stream interrupted — reconnecting automatically…'}</span>
+              </div>
+            )}
+
+            {/* ── Aggregate Stats ────────────────────────────────── */}
             {cameraIds.length > 0 && (
               <div className="grid grid-cols-3 gap-4">
                 <div className="rounded-lg bg-card p-4 shadow-sm border border-border">
@@ -591,18 +590,18 @@ export default function LiveTrackerDashboard() {
             )}
           </div>
 
-          {/* Sidebar - Recent Identifications */}
+          {/* ── Sidebar — Recent Identifications (top 50, scrollable) ── */}
           <div className="space-y-4">
             <div className="rounded-lg bg-card p-5 shadow-panel border border-border">
               <div className="mb-4 flex items-center justify-between">
                 <h2 className="text-lg font-semibold text-foreground">Recent Identifications</h2>
                 <div className="flex items-center gap-2">
-                  <span className="flex h-6 w-6 items-center justify-center rounded-full bg-primary text-xs font-bold text-primary-foreground">
+                  <span className="flex h-6 min-w-6 items-center justify-center rounded-full bg-primary px-1.5 text-xs font-bold text-primary-foreground">
                     {recentMatches.length}
                   </span>
                   {recentMatches.length > 0 && (
                     <button
-                      onClick={() => { setRecentMatches([]); localStorage.removeItem(LS_MATCHES_KEY); }}
+                      onClick={() => { setRecentMatches([]); sessionStorage.removeItem(SS_MATCHES_KEY); }}
                       className="text-xs text-muted hover:text-destructive transition-colors"
                       title="Clear history"
                     >
@@ -612,7 +611,9 @@ export default function LiveTrackerDashboard() {
                 </div>
               </div>
 
-              <div className="space-y-3 max-h-[calc(100vh-280px)] overflow-y-auto pr-2">
+              {/* Scrollable list — max 50 items */}
+              <div className="space-y-3 max-h-[calc(100vh-280px)] overflow-y-auto pr-1"
+                style={{ scrollbarGutter: 'stable' }}>
                 {recentMatches.length === 0 ? (
                   <div className="py-12 text-center">
                     <div className="mb-3 inline-flex h-12 w-12 items-center justify-center rounded-full bg-muted/20">
@@ -628,19 +629,19 @@ export default function LiveTrackerDashboard() {
                     const trackerColor = trackerColors.get(match.tracker_id);
                     return (
                       <div
-                        key={match.id}
+                        key={`${match.id}-${match.tracker_id}`}
                         className="group rounded-lg border bg-background-secondary p-3 transition-all hover:shadow-md"
                         style={{
                           borderColor: trackerColor === 'red' ? '#ef4444' : trackerColor === 'green' ? '#22c55e' : undefined
                         }}
                       >
                         <div className="flex items-start gap-3">
-                          <div className="relative h-16 w-16 flex-shrink-0 overflow-hidden rounded-lg border-2"
+                          <div className="relative h-16 w-16 shrink-0 overflow-hidden rounded-lg border-2"
                             style={{
                               borderColor: trackerColor === 'red' ? '#ef4444' : trackerColor === 'green' ? '#22c55e' : '#1f8a70'
                             }}>
                             {match.image ? (
-                              <img src={match.image} alt={`Person ${match.id}`} className="h-full w-full object-cover" />
+                              <img src={match.image} alt={`Person ${match.id}`} className="h-full w-full object-cover" loading="lazy" />
                             ) : (
                               <div className="h-full w-full flex items-center justify-center bg-muted/20">
                                 <svg className="h-6 w-6 text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -650,8 +651,7 @@ export default function LiveTrackerDashboard() {
                             )}
                             {trackerColor && (
                               <div className="absolute -top-1 -right-1 h-5 w-5 rounded-full border-2 border-white shadow-md"
-                                style={{ backgroundColor: trackerColor === 'red' ? '#ef4444' : '#22c55e' }}>
-                              </div>
+                                style={{ backgroundColor: trackerColor === 'red' ? '#ef4444' : '#22c55e' }} />
                             )}
                           </div>
                           <div className="flex-1 min-w-0">
@@ -662,17 +662,16 @@ export default function LiveTrackerDashboard() {
                                   <span className="flex items-center gap-1 text-xs font-semibold"
                                     style={{ color: trackerColor === 'red' ? '#ef4444' : '#22c55e' }}>
                                     <span className="h-2 w-2 rounded-full"
-                                      style={{ backgroundColor: trackerColor === 'red' ? '#ef4444' : '#22c55e' }}></span>
+                                      style={{ backgroundColor: trackerColor === 'red' ? '#ef4444' : '#22c55e' }} />
                                     {trackerColor.toUpperCase()}
                                   </span>
                                 )}
                               </div>
-                              <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${parseFloat(match.score) >= 80
-                                ? 'bg-success-soft text-success'
-                                : parseFloat(match.score) >= 60
-                                  ? 'bg-warning-soft text-warning'
-                                  : 'bg-destructive-soft text-destructive'
-                                }`}>
+                              <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${
+                                parseFloat(match.score) >= 80 ? 'bg-success-soft text-success'
+                                : parseFloat(match.score) >= 60 ? 'bg-warning-soft text-warning'
+                                : 'bg-destructive-soft text-destructive'
+                              }`}>
                                 {match.score}%
                               </span>
                             </div>
@@ -688,9 +687,9 @@ export default function LiveTrackerDashboard() {
             </div>
 
             {/* Connection Info */}
-            <div className="rounded-lg bg-gradient-to-br from-primary/5 to-accent/5 p-4 border border-primary/20">
+            <div className="rounded-lg bg-linear-to-br from-primary/5 to-accent/5 p-4 border border-primary/20">
               <div className="flex items-start gap-3">
-                <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg bg-primary/10">
+                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary/10">
                   <svg className="h-4 w-4 text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                   </svg>
