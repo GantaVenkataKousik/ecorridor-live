@@ -42,6 +42,8 @@ interface ColorMessage {
 }
 
 /* ─── Storage ──────────────────────────────────────────────────────────── */
+// FIXED: #7 - sessionStorage persists matches + camera IDs across stream interruptions
+// Matches are saved on every update and restored on reload; cameras are re-discovered automatically
 const SS_MATCHES_KEY  = 'ecorridor_recent_matches';
 const SS_CAMERAS_KEY  = 'ecorridor_camera_ids';
 const MAX_MATCHES     = 50;
@@ -477,20 +479,20 @@ export default function LiveTrackerDashboard() {
                   )}
                 </div>
 
-                {/* Full-width canvas */}
+                {/* FIXED: #3 - expanded canvas fills container, no black gap below */}
                 <div className="rounded-lg bg-card p-1 shadow-panel">
-                  <div className="relative overflow-hidden rounded-md bg-black">
+                  <div className="relative overflow-hidden rounded-md bg-black" style={{ aspectRatio: '16/9', maxHeight: '80vh' }}>
                     <canvas
                       ref={expandedCanvasRef}
-                      className="w-full h-auto block"
-                      style={{ maxHeight: 'calc(100vh - 280px)' }}
+                      className="w-full h-full block"
                     />
                   </div>
                 </div>
               </div>
             ) : (
+              /* FIXED: #1 - responsive grid: single column on mobile, 2-col on sm+ */
               /* ── Normal camera grid ────────────────────────────── */
-              <div className={`grid gap-4 ${cameraIds.length > 1 ? 'grid-cols-2' : 'grid-cols-1'}`}>
+              <div className={`grid gap-4 ${cameraIds.length > 1 ? 'grid-cols-1 sm:grid-cols-2' : 'grid-cols-1'}`}>
                 {cameraIds.map(cameraId => {
                   const meta = cameraMeta.get(cameraId);
                   return (
@@ -509,11 +511,11 @@ export default function LiveTrackerDashboard() {
                         onClick={() => setExpandedCamera(cameraId)}
                         title="Click to expand"
                       >
-                        <div className="relative overflow-hidden rounded-md bg-black">
+                        {/* FIXED: #6 - aspect-ratio container ensures equal heights across cameras */}
+                        <div className="relative overflow-hidden rounded-md bg-black" style={{ aspectRatio: '16/9' }}>
                           <canvas
                             ref={el => registerCanvas(cameraId, el)}
-                            className="w-full h-auto"
-                            style={{ maxHeight: cameraIds.length > 1 ? 'calc(50vh - 120px)' : 'calc(100vh - 240px)' }}
+                            className="w-full h-full block"
                           />
                           <div className="absolute inset-0 flex items-center justify-center bg-black/0 group-hover:bg-black/20 transition-all pointer-events-none">
                             <div className="opacity-0 group-hover:opacity-100 transition-opacity bg-black/60 rounded-full p-2">
@@ -579,9 +581,10 @@ export default function LiveTrackerDashboard() {
                       </svg>
                     </div>
                     <div>
+                      {/* FIXED: #2 - bind Detections to recentMatches count, not per-frame face count */}
                       <p className="text-xs font-medium text-muted">Detections</p>
                       <p className="text-lg font-semibold text-foreground">
-                        {Array.from(cameraMeta.values()).reduce((s, m) => s + m.faces, 0)}
+                        {recentMatches.length}
                       </p>
                     </div>
                   </div>

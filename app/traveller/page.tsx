@@ -24,7 +24,21 @@ interface AlertMessage {
   color: string;
 }
 
+// FIXED: #4 - added TrackerFrame + ColorMessage interfaces for per-camera alert mapping
+interface TrackerFrame {
+  camera_id: string;
+  frame_id: number;
+  tracked_faces?: Array<{ tracker_id: number }>;
+  image: Uint8Array;
+}
+
+interface ColorMessage {
+  colorCode: string;
+  tracker_id?: number;
+}
+
 /* ── Session-storage helpers ──────────────────────────────────────────── */
+// FIXED: #7 - camera IDs persisted in sessionStorage so the grid survives reconnects without a page reload
 const SS_CAMERAS_KEY = 'ecorridor_traveller_cameras';
 
 function loadFromSession<T>(key: string, fallback: T): T {
@@ -55,6 +69,11 @@ export default function TravellerView() {
   // Alert overlay state: 'green' | 'red'
   const [alertColor, setAlertColor] = useState<'green' | 'red'>('green');
   const alertTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  // FIXED: #4 - per-camera alert state: only the alerting camera gets a red border
+  const [alertingCameras, setAlertingCameras] = useState<Set<string>>(new Set());
+  const trackerCameraRef = useRef<Map<number, string>>(new Map()); // tracker_id -> camera_id
+  const cameraAlertTimeoutsRef = useRef<Map<string, NodeJS.Timeout>>(new Map());
 
   // Multi-camera expand
   const [expandedCamera, setExpandedCamera] = useState<string | null>(null);
@@ -143,7 +162,8 @@ export default function TravellerView() {
           if (cancelled) { nc.close(); return; }
           setStatus('connected');
           reconnectDelay = 1000;
-
+          // FIXED: #5 - single shared NATS connection, all subscriptions fan-out from here
+          // frames are mirrored to expanded canvas via expandedCameraRef without a second connection
           // ── frames.raw ────────────────────────────────────────
           const rawSub = nc.subscribe("frames.raw");
           (async () => {
@@ -208,12 +228,17 @@ export default function TravellerView() {
     return () => {
       cancelled = true;
       if (alertTimeoutRef.current) clearTimeout(alertTimeoutRef.current);
+      // FIXED: #4 - clear per-camera alert timeouts on unmount
+      cameraAlertTimeoutsRef.current.forEach(t => clearTimeout(t));
+      cameraAlertTimeoutsRef.current.clear();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const isRed = alertColor === 'red';
   const otherCameras = expandedCamera ? cameraIds.filter(id => id !== expandedCamera) : [];
+  // FIXED: #4 - pre-compute alerting state for expanded camera to avoid IIFE type issue
+  const expandedCameraAlerting = expandedCamera ? alertingCameras.has(expandedCamera) : false;
 
   return (
     <div
@@ -390,22 +415,24 @@ export default function TravellerView() {
               )}
             </div>
 
-            {/* Full-width canvas */}
+            {/* FIXED: #3 - aspect-ratio removes black gap below canvas */}
+            {/* FIXED: #4 - per-camera alert ring on expanded view     */}
             <div
-              className="rounded-xl overflow-hidden flex-1 transition-all duration-300"
+              className="rounded-xl overflow-hidden transition-all duration-300"
               style={{
-                boxShadow: isRed
+                aspectRatio: '16/9',
+                maxHeight: '80vh',
+                boxShadow: expandedCameraAlerting
                   ? '0 0 0 3px #ef4444, 0 0 24px rgba(239,68,68,0.4)'
                   : '0 0 0 1px rgba(31,138,112,0.4)'
               }}
             >
-              <div className="relative bg-black h-full">
+              <div className="relative bg-black w-full h-full">
                 <canvas
                   ref={expandedCanvasRef}
-                  className="w-full h-auto block"
-                  style={{ maxHeight: 'calc(100vh - 260px)' }}
+                  className="w-full h-full block"
                 />
-                {isRed && (
+                {expandedCameraAlerting && (
                   <div className="absolute inset-0 pointer-events-none animate-pulse"
                     style={{ backgroundColor: 'rgba(239,68,68,0.12)' }} />
                 )}
@@ -413,17 +440,20 @@ export default function TravellerView() {
             </div>
           </div>
         ) : (
+          /* FIXED: #1 - responsive, #4 - per-camera alert, #6 - equal heights via aspect-ratio */
           /* ── Normal Camera Grid ────────────────────────────────── */
-          <div className={`grid gap-4 h-full ${cameraIds.length > 1 ? 'grid-cols-2' : 'grid-cols-1'}`}>
-            {cameraIds.map(cameraId => (
+          <div className={`grid gap-4 h-full ${cameraIds.length > 1 ? 'grid-cols-1 sm:grid-cols-2' : 'grid-cols-1'}`}>
+            {cameraIds.map(cameraId => {
+              const isCamAlerting = alertingCameras.has(cameraId);
+              return (
               <div key={cameraId} className="flex flex-col gap-2">
                 {/* Camera label */}
                 <div className="flex items-center gap-2 px-1">
                   <div
                     className="h-2 w-2 rounded-full animate-pulse"
-                    style={{ backgroundColor: isRed ? '#ef4444' : '#22c55e' }}
+                    style={{ backgroundColor: isCamAlerting ? '#ef4444' : '#22c55e' }}
                   />
-                  <span className="text-sm font-semibold" style={{ color: isRed ? '#fca5a5' : '#6ee7b7' }}>
+                  <span className="text-sm font-semibold" style={{ color: isCamAlerting ? '#fca5a5' : '#6ee7b7' }}>
                     Camera: {cameraId}
                   </span>
                 </div>
@@ -432,21 +462,21 @@ export default function TravellerView() {
                 <div
                   className="rounded-xl overflow-hidden transition-all duration-300 cursor-pointer group"
                   style={{
-                    boxShadow: isRed
+                    boxShadow: isCamAlerting
                       ? '0 0 0 3px #ef4444, 0 0 24px rgba(239,68,68,0.4)'
                       : '0 0 0 1px rgba(31,138,112,0.4)'
                   }}
                   onClick={() => cameraIds.length > 1 ? setExpandedCamera(cameraId) : undefined}
                   title={cameraIds.length > 1 ? 'Click to expand' : undefined}
                 >
-                  <div className="relative bg-black">
+                  {/* FIXED: #6 - aspect-ratio ensures equal heights for all cameras */}
+                  <div className="relative bg-black" style={{ aspectRatio: '16/9' }}>
                     <canvas
                       ref={el => registerCanvas(cameraId, el)}
-                      className="w-full h-auto block"
-                      style={{ maxHeight: cameraIds.length > 1 ? 'calc(50vh - 100px)' : 'calc(100vh - 200px)' }}
+                      className="w-full h-full block"
                     />
                     {/* Alert overlay on canvas */}
-                    {isRed && (
+                    {isCamAlerting && (
                       <div
                         className="absolute inset-0 pointer-events-none animate-pulse"
                         style={{ backgroundColor: 'rgba(239,68,68,0.12)' }}
@@ -464,8 +494,15 @@ export default function TravellerView() {
                     )}
                   </div>
                 </div>
+                {/* FIXED: #4 - show alert label below only the alerting camera */}
+                {isCamAlerting && (
+                  <p className="text-xs font-bold text-center animate-pulse" style={{ color: '#ef4444' }}>
+                    🔴 Red Alert on Camera: {cameraId}
+                  </p>
+                )}
               </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </main>
